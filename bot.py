@@ -48,7 +48,7 @@ SHOPEE_LINK_PATTERN = re.compile(
 )
 
 SHOPEE_SHORT_PATTERN = re.compile(
-    r"https?://s\.shopee\.[\w.]+/[\w]+",
+    r"https?://(?:s\.shopee\.[\w.]+|[\w-]+\.shp\.ee|shp\.ee)/[\w\-./!?=&%+@#]+",
     re.IGNORECASE,
 )
 
@@ -88,6 +88,9 @@ async def extract_video_url(page, url: str) -> str | None:
         pass
 
     match = re.search(r"i\.(\d+)\.(\d+)", target_url)
+    if not match:
+        match = re.search(r"product/(\d+)/(\d+)", target_url)
+        
     if match:
         shop_id = match.group(1)
         item_id = match.group(2)
