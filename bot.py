@@ -167,6 +167,11 @@ async def get_video_url_playwright(url: str, browser_ctx) -> str | None:
             # Tentar remover _wm da URL para forçar o vídeo limpo
             import re
             clean_forced = re.sub(r'(_wm|-wm|watermark)', '', best_url, flags=re.IGNORECASE)
+            
+            # A mágica final para vídeos curtos da Shopee: remover a numeração no final do arquivo
+            # que indica o render com marca d'água (ex: .1600355.8302.mp4 -> .mp4)
+            clean_forced = re.sub(r'\.\d+\.\d+\.mp4$', '.mp4', clean_forced, flags=re.IGNORECASE)
+            
             if clean_forced != best_url:
                 # Se mudou, colocar a URL limpa como prioridade 1 para testar no download
                 return clean_forced
@@ -185,9 +190,6 @@ async def download_video(url: str, dest: Path) -> bool:
         "Referer": "https://shopee.com.br/",
     }
     urls_to_try = [url]
-    clean = re.sub(r"\.\d+\.\d+\.mp4", ".mp4", url)
-    if clean != url:
-        urls_to_try.insert(0, clean)
 
     for target in urls_to_try:
         for attempt in range(2):
