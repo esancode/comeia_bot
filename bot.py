@@ -1,5 +1,4 @@
 import os
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.getcwd(), ".playwright")
 import re
 import asyncio
 import zipfile
@@ -7,9 +6,9 @@ import shutil
 import logging
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import httpx
-from playwright.async_api import async_playwright
 
 from telegram import (
     Update,
@@ -34,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "8801492248:AAHJP8iEWT19ZcpBU_blm1pNYki3k3vNcK4"
+TOKEN = os.environ.get("BOT_TOKEN", "8801492248:AAHJP8iEWT19ZcpBU_blm1pNYki3k3vNcK4")
 
 CHOOSING, SINGLE_LINK, BATCH_LINKS = range(3)
 
@@ -42,191 +41,209 @@ BASE_DIR = Path(__file__).parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
-SHOPEE_LINK_PATTERN = re.compile(
-    r"https?://(?:[\w-]+\.)?shope[e]\.[\w.]+/[\w\-./!?=&%+@#]+",
+SHOPEE_LINK_RE = re.compile(
+    r"https?://(?:[\w-]+\.)*(?:shopee\.[\w.]+|shp\.ee|s\.shopee\.[\w.]+)/[\w\-./!?=&%+@#]+",
     re.IGNORECASE,
 )
 
-SHOPEE_SHORT_PATTERN = re.compile(
-    r"https?://(?:s\.shopee\.[\w.]+|[\w-]+\.shp\.ee|shp\.ee)/[\w\-./!?=&%+@#]+",
-    re.IGNORECASE,
-)
+HEADERS_MOBILE = {
+    "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Referer": "https://shopee.com.br/",
+}
+
+HEADERS_DESKTOP = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    "Referer": "https://shopee.com.br/",
+    "X-Requested-With": "XMLHttpRequest",
+}
 
 
-def is_shopee_link(text: str) -> bool:
-    return bool(SHOPEE_LINK_PATTERN.match(text.strip())) or bool(SHOPEE_SHORT_PATTERN.match(text.strip()))
+def find_shopee_link(text: str) -> str | None:
+    match = SHOPEE_LINK_RE.search(text.strip())
+    return match.group(0) if match else None
 
 
-def extract_shopee_links(text: str) -> list[str]:
-    links = []
-    for line in text.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        if is_shopee_link(line):
-            links.append(line)
-        else:
-            return []
-    return links
+def find_all_shopee_links(text: str) -> list[str]:
+    return SHOPEE_LINK_RE.findall(text)
 
 
-async def extract_video_url(page, url: str) -> str | None:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Referer": "https://shopee.com.br/",
-        "Accept": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-    
-    target_url = url
-    try:
-        if "s.shopee.com.br" in url or "shp.ee" in url:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
-                r = await client.get(url, headers=headers)
-                target_url = str(r.url)
-    except Exception:
-        pass
+async def resolve_url(url: str) -> str:
+    if "shp.ee" not in url and "s.shopee" not in url:
+        return url
 
-    match = re.search(r"i\.(\d+)\.(\d+)", target_url)
-    if not match:
-        match = re.search(r"product/(\d+)/(\d+)", target_url)
-        
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=HEADERS_MOBILE) as client:
+                r = await client.get(url)
+                resolved = str(r.url)
+                logger.info(f"URL resolvida: {url} -> {resolved}")
+                return resolved
+        except Exception as e:
+            logger.warning(f"Tentativa {attempt + 1}/3 de resolver URL falhou: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+    return url
+
+
+def extract_ids(url: str) -> tuple[str, str] | None:
+    match = re.search(r"i\.(\d+)\.(\d+)", url)
     if match:
-        shop_id = match.group(1)
-        item_id = match.group(2)
-        api_url = f"https://shopee.com.br/api/v4/item/get?itemid={item_id}&shopid={shop_id}"
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(api_url, headers=headers)
-                if r.status_code == 200:
-                    res_data = r.json()
-                    item_data = res_data.get("data", {})
-                    if not item_data:
-                        item_data = res_data.get("item", {})
-                    
-                    video_list = item_data.get("video_info_list", [])
-                    if video_list and isinstance(video_list, list):
-                        v_info = video_list[0]
-                        if isinstance(v_info, dict):
-                            v_url = v_info.get("video_url") or v_info.get("url")
-                            if not v_url and "default_format" in v_info:
-                                v_url = v_info["default_format"].get("url")
-                            if v_url:
-                                return v_url
-        except Exception:
-            pass
+        return match.group(1), match.group(2)
 
-    if page is None:
+    match = re.search(r"product/(\d+)/(\d+)", url)
+    if match:
+        return match.group(1), match.group(2)
+
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    shop = params.get("shopid") or params.get("shop_id")
+    item = params.get("itemid") or params.get("item_id")
+    if shop and item:
+        return shop[0], item[0]
+
+    match = re.search(r"\.(\d{5,})\.(\d{5,})", url)
+    if match:
+        return match.group(1), match.group(2)
+
+    return None
+
+
+def extract_video_from_response(data: dict) -> str | None:
+    item_data = data.get("data") or data.get("item") or {}
+
+    video_list = item_data.get("video_info_list") or []
+    if isinstance(video_list, list):
+        for v in video_list:
+            if not isinstance(v, dict):
+                continue
+
+            for fmt_key in ["formats", "video_url_list"]:
+                fmt_list = v.get(fmt_key) or []
+                if isinstance(fmt_list, list):
+                    for fmt in fmt_list:
+                        if isinstance(fmt, dict):
+                            u = fmt.get("url")
+                            if u:
+                                return u
+
+            u = v.get("video_url") or v.get("url")
+            if u:
+                return u
+
+            default_fmt = v.get("default_format")
+            if isinstance(default_fmt, dict):
+                u = default_fmt.get("url")
+                if u:
+                    return u
+
+    video = item_data.get("video")
+    if isinstance(video, dict):
+        u = video.get("video_url") or video.get("url")
+        if u:
+            return u
+
+    tier_vars = item_data.get("tier_variations") or []
+    if isinstance(tier_vars, list):
+        for tv in tier_vars:
+            if isinstance(tv, dict):
+                u = tv.get("video")
+                if u and isinstance(u, str):
+                    return u
+
+    return None
+
+
+async def fetch_video_url(shop_id: str, item_id: str) -> str | None:
+    api_urls = [
+        f"https://shopee.com.br/api/v4/item/get?itemid={item_id}&shopid={shop_id}",
+        f"https://shopee.com.br/api/v2/item/get?itemid={item_id}&shopid={shop_id}",
+    ]
+
+    headers_list = [HEADERS_MOBILE, HEADERS_DESKTOP]
+
+    for api_url in api_urls:
+        for headers in headers_list:
+            for attempt in range(2):
+                try:
+                    h = {**headers, "Referer": f"https://shopee.com.br/product/{shop_id}/{item_id}"}
+                    async with httpx.AsyncClient(timeout=15, headers=h) as client:
+                        r = await client.get(api_url)
+                        if r.status_code != 200:
+                            continue
+
+                        data = r.json()
+                        video_url = extract_video_from_response(data)
+                        if video_url:
+                            logger.info(f"Video encontrado via API: {api_url}")
+                            return video_url
+
+                except Exception as e:
+                    logger.warning(f"API falhou ({api_url}): {e}")
+                    if attempt < 1:
+                        await asyncio.sleep(0.5)
+
+    return None
+
+
+async def get_video_url(link: str) -> str | None:
+    resolved = await resolve_url(link)
+
+    ids = extract_ids(resolved)
+    if not ids:
+        logger.warning(f"IDs não encontrados em: {resolved}")
         return None
 
-    video_urls = []
+    shop_id, item_id = ids
+    logger.info(f"IDs: shop={shop_id}, item={item_id}")
 
-    def handle_response(response):
-        content_type = response.headers.get("content-type", "")
-        req_url = response.url
-        if ".mp4" in req_url or "video" in content_type:
-            if req_url not in video_urls:
-                video_urls.append(req_url)
+    video_url = await fetch_video_url(shop_id, item_id)
+    return video_url
 
-    page.on("response", handle_response)
 
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(3000)
+async def download_video(url: str, dest: Path) -> bool:
+    urls_to_try = [url]
+    clean = re.sub(r"\.\d+\.\d+\.mp4", ".mp4", url)
+    if clean != url:
+        urls_to_try.insert(0, clean)
 
-        try:
-            play_btn = page.locator('[class*="video"], [class*="play"], [aria-label*="play"], [data-testid*="video"]').first
-            if await play_btn.count() > 0:
-                await play_btn.click(timeout=3000)
-                await page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
-        try:
-            await page.evaluate("""
-                () => {
-                    const videos = document.querySelectorAll('video');
-                    videos.forEach(v => {
-                        if (v.src) v.play();
-                    });
-                }
-            """)
-            await page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        try:
-            src = await page.evaluate("""
-                () => {
-                    const videos = document.querySelectorAll('video');
-                    for (const v of videos) {
-                        if (v.src && v.src.startsWith('http')) return v.src;
-                        const source = v.querySelector('source');
-                        if (source && source.src && source.src.startsWith('http')) return source.src;
-                    }
-                    return null;
-                }
-            """)
-            if src and src not in video_urls:
-                video_urls.insert(0, src)
-        except Exception:
-            pass
-
-        if not video_urls:
+    for target in urls_to_try:
+        for attempt in range(3):
             try:
-                await page.mouse.wheel(0, 600)
-                await page.wait_for_timeout(2000)
-
-                src = await page.evaluate("""
-                    () => {
-                        const videos = document.querySelectorAll('video');
-                        for (const v of videos) {
-                            if (v.src && v.src.startsWith('http')) return v.src;
-                            const source = v.querySelector('source');
-                            if (source && source.src && source.src.startsWith('http')) return source.src;
-                        }
-                        return null;
-                    }
-                """)
-                if src:
-                    video_urls.insert(0, src)
-            except Exception:
-                pass
-
-    except Exception:
-        return None
-
-    mp4_urls = [u for u in video_urls if ".mp4" in u]
-    if mp4_urls:
-        return mp4_urls[0]
-
-    return video_urls[0] if video_urls else None
-
-
-async def download_video(url: str, dest_path: Path) -> bool:
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            "Referer": "https://shopee.com.br/",
-        }
-        urls_to_try = [url]
-        clean_url = re.sub(r"\.[0-9]+\.[0-9]+\.mp4", ".mp4", url)
-        if clean_url != url:
-            urls_to_try.insert(0, clean_url)
-        
-        for target_url in urls_to_try:
-            try:
-                async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
-                    async with client.stream("GET", target_url, headers=headers) as resp:
-                        if resp.status_code == 200:
-                            with open(dest_path, "wb") as f:
-                                async for chunk in resp.aiter_bytes(chunk_size=1024 * 64):
-                                    f.write(chunk)
+                async with httpx.AsyncClient(follow_redirects=True, timeout=120, headers=HEADERS_MOBILE) as client:
+                    async with client.stream("GET", target) as resp:
+                        if resp.status_code != 200:
+                            break
+                        with open(dest, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=1024 * 128):
+                                f.write(chunk)
+                        if dest.stat().st_size > 0:
                             return True
-            except Exception:
-                pass
-        return False
-    except Exception:
+            except Exception as e:
+                logger.warning(f"Download tentativa {attempt + 1}/3: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(1)
+    return False
+
+
+async def send_video_by_url(context, chat_id: int, video_url: str, caption: str, reply_markup=None) -> bool:
+    try:
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=video_url,
+            caption=caption,
+            supports_streaming=True,
+            reply_markup=reply_markup,
+            read_timeout=60,
+            write_timeout=60,
+            connect_timeout=30,
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Envio direto por URL falhou: {e}")
         return False
 
 
@@ -236,45 +253,19 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="⏳ *Processando o link...*\n\n🔍 Acessando a página do produto...",
+        text="⏳ *Buscando vídeo...*",
         parse_mode="Markdown",
     )
 
-    session_dir = DOWNLOADS_DIR / f"session_{chat_id}_{uuid.uuid4().hex[:8]}"
+    session_dir = DOWNLOADS_DIR / f"s_{chat_id}_{uuid.uuid4().hex[:6]}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        video_url = await extract_video_url(None, link)
-        if not video_url:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                ctx = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    viewport={"width": 1366, "height": 768},
-                    locale="pt-BR",
-                )
-                await ctx.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                """)
-                page = await ctx.new_page()
-                await status_msg.edit_text(
-                    "⏳ *Processando o link...*\n\n🎬 Buscando o vídeo na página...",
-                    parse_mode="Markdown",
-                )
-                video_url = await extract_video_url(page, link)
-                await browser.close()
+        video_url = await get_video_url(link)
 
         if not video_url:
             await status_msg.edit_text(
-                "❌ *Não foi possível encontrar o vídeo neste link.*\n\n"
+                "❌ *Vídeo não encontrado.*\n\n"
                 "Possíveis motivos:\n"
                 "• O produto não possui vídeo\n"
                 "• O link está incorreto ou expirado\n"
@@ -284,10 +275,22 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return False
 
-        await status_msg.edit_text(
-            "⏳ *Processando o link...*\n\n⬇️ Baixando o vídeo...",
-            parse_mode="Markdown",
+        keyboard = [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="restart")]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+        await status_msg.edit_text("⏳ *Enviando vídeo...*", parse_mode="Markdown")
+
+        sent = await send_video_by_url(
+            context, chat_id, video_url,
+            "✅ Vídeo baixado da Shopee com sucesso!",
+            reply_markup=markup,
         )
+
+        if sent:
+            await status_msg.delete()
+            return True
+
+        await status_msg.edit_text("⏳ *Baixando vídeo...*", parse_mode="Markdown")
 
         video_path = session_dir / "video.mp4"
         success = await download_video(video_url, video_path)
@@ -295,7 +298,7 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not success or not video_path.exists() or video_path.stat().st_size == 0:
             await status_msg.edit_text(
                 "❌ *Falha ao baixar o vídeo.*\n\n"
-                "O servidor da Shopee pode estar bloqueando o download.\n"
+                "O servidor da Shopee pode estar bloqueando.\n"
                 "Tente novamente mais tarde com /start",
                 parse_mode="Markdown",
             )
@@ -305,22 +308,14 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         if file_size > 50 * 1024 * 1024:
             await status_msg.edit_text(
                 "❌ *O vídeo é muito grande* (> 50MB).\n\n"
-                "O Telegram não permite envio de arquivos maiores que 50MB.\n"
+                "O Telegram não permite arquivos maiores que 50MB.\n"
                 "Tente outro vídeo com /start",
                 parse_mode="Markdown",
             )
             return False
 
-        await status_msg.edit_text(
-            "⏳ *Processando o link...*\n\n📤 Enviando o vídeo...",
-            parse_mode="Markdown",
-        )
-
+        await status_msg.edit_text("⏳ *Enviando vídeo...*", parse_mode="Markdown")
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
-
-        keyboard = [
-            [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="restart")],
-        ]
 
         with open(video_path, "rb") as vf:
             await context.bot.send_video(
@@ -328,7 +323,9 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
                 video=vf,
                 caption="✅ Vídeo baixado da Shopee com sucesso!",
                 supports_streaming=True,
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                reply_markup=markup,
+                read_timeout=120,
+                write_timeout=120,
             )
 
         await status_msg.delete()
@@ -336,12 +333,15 @@ async def process_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except Exception as e:
         logger.error(f"Erro ao processar link: {e}")
-        await status_msg.edit_text(
-            f"❌ *Ocorreu um erro ao processar o vídeo.*\n\n"
-            f"Detalhes: `{str(e)[:200]}`\n\n"
-            f"Tente novamente com /start",
-            parse_mode="Markdown",
-        )
+        try:
+            await status_msg.edit_text(
+                f"❌ *Erro ao processar o vídeo.*\n\n"
+                f"Detalhes: `{str(e)[:200]}`\n\n"
+                f"Tente novamente com /start",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         return False
     finally:
         if session_dir.exists():
@@ -354,175 +354,143 @@ async def process_batch_links(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=f"📦 *Processamento em lote iniciado*\n\n"
-             f"Total de links: {total}\n"
-             f"Progresso: 0/{total}\n\n"
-             f"⏳ Isso pode levar alguns minutos...",
+        text=f"📦 *Lote: {total} link(s)*\n\n"
+             f"[{'░' * 10}] 0%\n\n"
+             f"⏳ Processando simultaneamente...",
         parse_mode="Markdown",
     )
 
-    session_dir = DOWNLOADS_DIR / f"batch_{chat_id}_{uuid.uuid4().hex[:8]}"
+    session_dir = DOWNLOADS_DIR / f"b_{chat_id}_{uuid.uuid4().hex[:6]}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    downloaded_files = []
-    failed_links = []
+    semaphore = asyncio.Semaphore(5)
+    completed = 0
+    downloaded = []
+    failed = []
+    lock = asyncio.Lock()
 
-    pending_links = []
-
-    try:
-        for idx, link in enumerate(links, 1):
-            progress_bar = "█" * int((idx / total) * 10) + "░" * (10 - int((idx / total) * 10))
+    async def process_one(idx: int, link: str):
+        nonlocal completed
+        async with semaphore:
             try:
+                video_url = await get_video_url(link)
+                if not video_url:
+                    async with lock:
+                        failed.append(f"Link {idx}: sem vídeo")
+                        completed += 1
+                    return
+
+                video_path = session_dir / f"video_{idx:03d}.mp4"
+                ok = await download_video(video_url, video_path)
+
+                async with lock:
+                    if ok and video_path.exists() and video_path.stat().st_size > 0:
+                        downloaded.append(video_path)
+                    else:
+                        failed.append(f"Link {idx}: download falhou")
+                    completed += 1
+
+            except Exception as e:
+                logger.error(f"Erro link {idx}: {e}")
+                async with lock:
+                    failed.append(f"Link {idx}: erro")
+                    completed += 1
+
+            try:
+                pct = int((completed / total) * 100)
+                bar_filled = int((completed / total) * 10)
+                bar = "█" * bar_filled + "░" * (10 - bar_filled)
                 await status_msg.edit_text(
-                    f"📦 *Processamento em lote*\n\n"
-                    f"Progresso: {idx}/{total}\n"
-                    f"[{progress_bar}] {int((idx / total) * 100)}%\n\n"
-                    f"🔍 Buscando vídeo {idx}...",
+                    f"📦 *Lote: {total} link(s)*\n\n"
+                    f"[{bar}] {pct}%\n"
+                    f"✅ {len(downloaded)} | ❌ {len(failed)}\n\n"
+                    f"Processando {completed}/{total}...",
                     parse_mode="Markdown",
                 )
             except Exception:
                 pass
 
-            video_url = await extract_video_url(None, link)
-            if video_url:
-                video_filename = f"video_{idx:03d}.mp4"
-                video_path = session_dir / video_filename
-                success = await download_video(video_url, video_path)
-                if success and video_path.exists() and video_path.stat().st_size > 0:
-                    downloaded_files.append(video_path)
-                else:
-                    pending_links.append((idx, link))
-            else:
-                pending_links.append((idx, link))
-            await asyncio.sleep(0.5)
+    tasks = [process_one(idx, link) for idx, link in enumerate(links, 1)]
+    await asyncio.gather(*tasks)
 
-        if pending_links:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-blink-features=AutomationControlled",
-                    ],
-                )
-                ctx = await browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    viewport={"width": 1366, "height": 768},
-                    locale="pt-BR",
-                )
-                await ctx.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                """)
-
-                for idx, link in pending_links:
-                    try:
-                        await status_msg.edit_text(
-                            f"📦 *Processamento em lote (Alternativo)*\n\n"
-                            f"Buscando vídeo {idx} com Playwright...",
-                            parse_mode="Markdown",
-                        )
-                    except Exception:
-                        pass
-
-                    page = await ctx.new_page()
-                    video_url = await extract_video_url(page, link)
-                    await page.close()
-
-                    if not video_url:
-                        failed_links.append(f"Link {idx}: {link[:50]}...")
-                        continue
-
-                    video_filename = f"video_{idx:03d}.mp4"
-                    video_path = session_dir / video_filename
-
-                    success = await download_video(video_url, video_path)
-                    if success and video_path.exists() and video_path.stat().st_size > 0:
-                        downloaded_files.append(video_path)
-                    else:
-                        failed_links.append(f"Link {idx}: {link[:50]}...")
-
-                    await asyncio.sleep(1)
-
-                await browser.close()
-
-        if not downloaded_files:
+    try:
+        if not downloaded:
             await status_msg.edit_text(
-                "❌ *Nenhum vídeo foi baixado com sucesso.*\n\n"
-                "Possíveis motivos:\n"
-                "• Os produtos não possuem vídeos\n"
-                "• Os links estão incorretos\n"
-                "• A Shopee bloqueou o acesso\n\n"
+                "❌ *Nenhum vídeo baixado.*\n\n"
+                "Os produtos podem não ter vídeos ou os links estão incorretos.\n\n"
                 "Tente novamente com /start",
                 parse_mode="Markdown",
             )
             return False
 
-        await status_msg.edit_text(
-            f"📦 *Processamento em lote*\n\n"
-            f"✅ {len(downloaded_files)} vídeo(s) baixado(s)\n"
-            f"❌ {len(failed_links)} falha(s)\n\n"
-            f"📁 Criando arquivo ZIP...",
-            parse_mode="Markdown",
-        )
+        keyboard = [[InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="restart")]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+        if len(downloaded) == 1:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_VIDEO)
+            caption = f"✅ *1 vídeo* baixado!"
+            if failed:
+                caption += f"\n⚠️ {len(failed)} link(s) falharam"
+
+            with open(downloaded[0], "rb") as vf:
+                await context.bot.send_video(
+                    chat_id=chat_id, video=vf, caption=caption,
+                    supports_streaming=True, reply_markup=markup,
+                    parse_mode="Markdown", read_timeout=120, write_timeout=120,
+                )
+            await status_msg.delete()
+            return True
+
+        await status_msg.edit_text("📁 *Criando ZIP...*", parse_mode="Markdown")
 
         zip_path = session_dir / "videos_shopee.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for video_file in sorted(downloaded_files):
-                zf.write(video_file, video_file.name)
+            for vf in sorted(downloaded):
+                zf.write(vf, vf.name)
 
         zip_size = zip_path.stat().st_size
         if zip_size > 50 * 1024 * 1024:
             await status_msg.edit_text(
-                f"❌ *O arquivo ZIP é muito grande* ({zip_size / (1024*1024):.1f}MB).\n\n"
-                f"O Telegram permite no máximo 50MB.\n"
+                f"❌ *ZIP muito grande* ({zip_size / (1024*1024):.1f}MB > 50MB).\n\n"
                 f"Tente com menos vídeos usando /start",
                 parse_mode="Markdown",
             )
             return False
 
-        await status_msg.edit_text(
-            f"📦 *Processamento em lote*\n\n"
-            f"📤 Enviando o arquivo ZIP...",
-            parse_mode="Markdown",
-        )
-
+        await status_msg.edit_text("📤 *Enviando ZIP...*", parse_mode="Markdown")
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
-        caption_lines = [f"✅ *{len(downloaded_files)} vídeo(s)* baixado(s) com sucesso!"]
-        if failed_links:
-            caption_lines.append(f"\n⚠️ *{len(failed_links)} link(s) falharam:*")
-            for fl in failed_links[:5]:
-                caption_lines.append(f"• {fl}")
-            if len(failed_links) > 5:
-                caption_lines.append(f"• ...e mais {len(failed_links) - 5}")
-
-        keyboard = [
-            [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="restart")],
-        ]
+        caption_parts = [f"✅ *{len(downloaded)} vídeo(s)* baixado(s)!"]
+        if failed:
+            caption_parts.append(f"\n⚠️ *{len(failed)} falha(s):*")
+            for fl in failed[:5]:
+                caption_parts.append(f"• {fl}")
+            if len(failed) > 5:
+                caption_parts.append(f"• ...e mais {len(failed) - 5}")
 
         with open(zip_path, "rb") as zf:
             await context.bot.send_document(
-                chat_id=chat_id,
-                document=zf,
+                chat_id=chat_id, document=zf,
                 filename="videos_shopee.zip",
-                caption="\n".join(caption_lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+                caption="\n".join(caption_parts),
+                parse_mode="Markdown", reply_markup=markup,
+                read_timeout=120, write_timeout=120,
             )
 
         await status_msg.delete()
         return True
 
     except Exception as e:
-        logger.error(f"Erro no processamento em lote: {e}")
-        await status_msg.edit_text(
-            f"❌ *Ocorreu um erro no processamento em lote.*\n\n"
-            f"Detalhes: `{str(e)[:200]}`\n\n"
-            f"Tente novamente com /start",
-            parse_mode="Markdown",
-        )
+        logger.error(f"Erro no lote: {e}")
+        try:
+            await status_msg.edit_text(
+                f"❌ *Erro no processamento.*\n\n"
+                f"Detalhes: `{str(e)[:200]}`\n\n"
+                f"Tente novamente com /start",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
         return False
     finally:
         if session_dir.exists():
@@ -538,11 +506,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
 
     welcome_text = (
-        "🛍️ *Shopee Video Downloader Bot*\n\n"
-        "Olá! Eu baixo vídeos de produtos da Shopee para você.\n\n"
-        "Escolha uma opção abaixo:\n\n"
-        "🎬 *Um único vídeo* — Envie um link e receba o vídeo\n"
-        "📦 *Lista de vídeos* — Envie vários links e receba um ZIP"
+        "🛍️ *Shopee Video Downloader*\n\n"
+        "Olá! Eu baixo vídeos de produtos da Shopee.\n\n"
+        "🎬 *Vídeo único* — Envie um link\n"
+        "📦 *Lista* — Envie vários links de uma vez"
     )
 
     if update.callback_query:
@@ -576,10 +543,12 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if query.data == "single":
         await query.edit_message_text(
             "🎬 *Modo: Vídeo Único*\n\n"
-            "Envie o link do produto da Shopee que contém o vídeo.\n\n"
-            "📎 Exemplo:\n"
-            "`https://shopee.com.br/produto-exemplo-i.123.456`\n\n"
-            "💡 Você pode copiar o link diretamente do app ou site da Shopee.",
+            "Envie o link do produto da Shopee.\n\n"
+            "📎 Aceito qualquer formato de link:\n"
+            "• `https://shopee.com.br/produto-i.123.456`\n"
+            "• `https://br.shp.ee/abc123`\n"
+            "• `https://s.shopee.com.br/abc`\n\n"
+            "💡 Cole o link diretamente do app ou site.",
             parse_mode="Markdown",
         )
         return SINGLE_LINK
@@ -587,16 +556,13 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "batch":
         await query.edit_message_text(
             "📦 *Modo: Lista de Vídeos*\n\n"
-            "Envie os links dos produtos da Shopee, *um por linha*.\n\n"
+            "Envie os links, *um por linha*.\n\n"
             "📎 Exemplo:\n"
             "`https://shopee.com.br/produto-1-i.123.456`\n"
-            "`https://shopee.com.br/produto-2-i.789.012`\n"
-            "`https://shopee.com.br/produto-3-i.345.678`\n\n"
-            "⚠️ *Regras:*\n"
-            "• Um link por linha\n"
-            "• Apenas links da Shopee\n"
-            "• Envie todos os links em *uma única mensagem*\n\n"
-            "💡 Você pode enviar quantos links quiser!",
+            "`https://br.shp.ee/abc123`\n"
+            "`https://shopee.com.br/produto-2-i.789.012`\n\n"
+            "⚠️ Envie todos em *uma única mensagem*.\n"
+            "⚡ Todos são processados *simultaneamente*!",
             parse_mode="Markdown",
         )
         return BATCH_LINKS
@@ -606,66 +572,45 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_single_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
+    link = find_shopee_link(text)
 
-    if not is_shopee_link(text):
+    if not link:
         await update.message.reply_text(
             "⚠️ *Link inválido!*\n\n"
-            "Por favor, envie um link válido da Shopee.\n\n"
-            "📎 Exemplo:\n"
-            "`https://shopee.com.br/produto-exemplo-i.123.456`\n\n"
-            "Ou envie /cancelar para voltar ao menu.",
+            "Envie um link válido da Shopee.\n\n"
+            "📎 Exemplos aceitos:\n"
+            "• `https://shopee.com.br/produto-i.123.456`\n"
+            "• `https://br.shp.ee/abc123`\n\n"
+            "Ou envie /cancelar para voltar.",
             parse_mode="Markdown",
         )
         return SINGLE_LINK
 
-    await process_single_link(update, context, text)
+    await process_single_link(update, context, link)
     return ConversationHandler.END
 
 
 async def handle_batch_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text.strip()
-    lines = text.split("\n")
+    links = find_all_shopee_links(text)
 
-    if len(lines) == 1 and not is_shopee_link(lines[0].strip()):
+    if not links:
         await update.message.reply_text(
-            "⚠️ *Formato inválido!*\n\n"
-            "Envie os links *um por linha*, em uma única mensagem.\n\n"
-            "📎 Exemplo correto:\n"
+            "⚠️ *Nenhum link da Shopee encontrado!*\n\n"
+            "Envie os links um por linha.\n\n"
+            "📎 Exemplo:\n"
             "`https://shopee.com.br/produto-1-i.123.456`\n"
-            "`https://shopee.com.br/produto-2-i.789.012`\n\n"
-            "❌ Não envie links separados por espaço ou vírgula.\n\n"
-            "Ou envie /cancelar para voltar ao menu.",
+            "`https://br.shp.ee/abc123`\n\n"
+            "Ou envie /cancelar para voltar.",
             parse_mode="Markdown",
         )
         return BATCH_LINKS
 
-    links = extract_shopee_links(text)
-
-    if not links:
-        invalid_lines = []
-        for i, line in enumerate(lines, 1):
-            line = line.strip()
-            if line and not is_shopee_link(line):
-                invalid_lines.append(f"Linha {i}: `{line[:60]}`")
-
-        error_text = (
-            "⚠️ *Alguns links são inválidos!*\n\n"
-            "Linhas com problema:\n"
-        )
-        for il in invalid_lines[:5]:
-            error_text += f"• {il}\n"
-
-        error_text += (
-            "\n📎 Todos os links devem ser da Shopee, um por linha.\n"
-            "Corrija e envie novamente, ou /cancelar para voltar."
-        )
-
-        await update.message.reply_text(error_text, parse_mode="Markdown")
-        return BATCH_LINKS
+    links = list(dict.fromkeys(links))
 
     await update.message.reply_text(
         f"✅ *{len(links)} link(s) detectado(s)!*\n\n"
-        f"Iniciando o download...",
+        f"⚡ Iniciando download simultâneo...",
         parse_mode="Markdown",
     )
 
@@ -679,14 +624,9 @@ async def restart_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-
-    keyboard = [
-        [InlineKeyboardButton("🔄 Recomeçar", callback_data="restart")],
-    ]
-
+    keyboard = [[InlineKeyboardButton("🔄 Recomeçar", callback_data="restart")]]
     await update.message.reply_text(
-        "❌ Operação cancelada.\n\n"
-        "Use /start para recomeçar quando quiser.",
+        "❌ Operação cancelada.\n\nUse /start para recomeçar.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return ConversationHandler.END
@@ -694,28 +634,33 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "📖 *Como usar o Shopee Video Downloader:*\n\n"
-        "1️⃣ Envie /start para iniciar\n"
-        "2️⃣ Escolha entre baixar um vídeo ou uma lista\n"
-        "3️⃣ Envie o(s) link(s) do(s) produto(s) da Shopee\n"
-        "4️⃣ Aguarde o bot processar e enviar o vídeo\n\n"
+        "📖 *Como usar:*\n\n"
+        "1️⃣ /start — Iniciar\n"
+        "2️⃣ Escolha vídeo único ou lista\n"
+        "3️⃣ Envie o(s) link(s) da Shopee\n"
+        "4️⃣ Receba o vídeo em segundos!\n\n"
         "*Comandos:*\n"
-        "/start - Iniciar o bot\n"
-        "/ajuda - Mostrar esta mensagem\n"
-        "/cancelar - Cancelar a operação atual\n\n"
-        "*Dicas:*\n"
-        "• Certifique-se de que o produto tem vídeo na página\n"
-        "• Links curtos da Shopee também funcionam\n"
-        "• No modo lista, envie um link por linha\n"
-        "• O limite do Telegram é 50MB por arquivo"
+        "/start — Iniciar o bot\n"
+        "/ajuda — Esta mensagem\n"
+        "/cancelar — Cancelar operação\n\n"
+        "*Formatos aceitos:*\n"
+        "• Links completos da Shopee\n"
+        "• Links curtos (shp.ee, s.shopee)\n"
+        "• Limite do Telegram: 50MB por arquivo"
     )
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
 
 async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🤔 Não entendi! Use /start para iniciar o bot.",
-    )
+    text = update.message.text.strip()
+    link = find_shopee_link(text)
+
+    if link:
+        await process_single_link(update, context, link)
+    else:
+        await update.message.reply_text(
+            "🤔 Não entendi! Use /start para iniciar o bot.",
+        )
 
 
 async def post_init(application: Application) -> None:
@@ -765,7 +710,7 @@ async def main() -> None:
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("Bot está rodando! Pressione Ctrl+C para parar.")
+        logger.info("Bot rodando!")
         try:
             while True:
                 await asyncio.sleep(1)
