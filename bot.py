@@ -1,4 +1,5 @@
 import os
+os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(os.getcwd(), ".playwright")
 import re
 import asyncio
 import zipfile
