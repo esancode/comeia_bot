@@ -6,7 +6,7 @@ import shutil
 import logging
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 import httpx
 
@@ -72,7 +72,15 @@ def find_all_shopee_links(text: str) -> list[str]:
 
 
 async def resolve_url(url: str) -> str:
-    if "shp.ee" not in url and "s.shopee" not in url:
+    if "universal-link" in url or "universal_link" in url:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        redir = params.get("redir")
+        if redir:
+            url = unquote(redir[0])
+            logger.info(f"Universal link extraído: {url}")
+
+    if extract_ids(url):
         return url
 
     for attempt in range(3):
@@ -189,18 +197,63 @@ async def fetch_video_url(shop_id: str, item_id: str) -> str | None:
     return None
 
 
+async def scrape_video_from_html(url: str) -> str | None:
+    for headers in [HEADERS_MOBILE, HEADERS_DESKTOP]:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=20, headers=headers) as client:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    continue
+                html = r.text
+
+                patterns = [
+                    r'"video_url"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"',
+                    r'"video"\s*:\s*\{[^}]*"url"\s*:\s*"(https?://[^"]+)"',
+                    r'<meta[^>]+property="og:video"[^>]+content="(https?://[^"]+)"',
+                    r'<meta[^>]+content="(https?://[^"]+)"[^>]+property="og:video"',
+                    r'<video[^>]+src="(https?://[^"]+)"',
+                    r'"playUrl"\s*:\s*"(https?://[^"]+)"',
+                    r'"play_url"\s*:\s*"(https?://[^"]+)"',
+                ]
+
+                for pattern in patterns:
+                    match = re.search(pattern, html, re.IGNORECASE)
+                    if match:
+                        video_url = match.group(1).replace("\\u002F", "/").replace("\\/", "/")
+                        logger.info(f"Video encontrado via HTML scraping")
+                        return video_url
+
+        except Exception as e:
+            logger.warning(f"HTML scraping falhou: {e}")
+    return None
+
+
 async def get_video_url(link: str) -> str | None:
     resolved = await resolve_url(link)
+    logger.info(f"Link final resolvido: {resolved}")
 
     ids = extract_ids(resolved)
     if not ids:
         logger.warning(f"IDs não encontrados em: {resolved}")
+        video_url = await scrape_video_from_html(resolved)
+        if video_url:
+            return video_url
         return None
 
     shop_id, item_id = ids
     logger.info(f"IDs: shop={shop_id}, item={item_id}")
 
     video_url = await fetch_video_url(shop_id, item_id)
+    if video_url:
+        return video_url
+
+    logger.info("API falhou, tentando HTML scraping...")
+    product_url = f"https://shopee.com.br/product/{shop_id}/{item_id}"
+    video_url = await scrape_video_from_html(product_url)
+    if video_url:
+        return video_url
+
+    video_url = await scrape_video_from_html(resolved)
     return video_url
 
 
