@@ -83,13 +83,25 @@ async def get_video_url_playwright(url: str, browser_ctx) -> str | None:
         page = await browser_ctx.new_page()
         video_urls = []
 
-        def handle_response(response):
+        async def handle_response(response):
             try:
                 content_type = response.headers.get("content-type", "")
                 req_url = response.url
-                if ".mp4" in req_url or "video" in content_type:
+                
+                # 1. Pegar links de arquivos MP4 diretos
+                if ".mp4" in req_url:
                     if req_url not in video_urls:
                         video_urls.append(req_url)
+                
+                # 2. Pegar links dentro do JSON da API (frequentemente são a versão limpa)
+                elif "application/json" in content_type and ("api/v" in req_url or "graphql" in req_url):
+                    text = await response.text()
+                    import re
+                    mp4s = re.findall(r'https?://[^"]+\.mp4[^"]*', text)
+                    for mp4 in mp4s:
+                        clean_mp4 = mp4.replace('\\u002F', '/').replace('\\/', '/')
+                        if clean_mp4 not in video_urls:
+                            video_urls.append(clean_mp4)
             except Exception:
                 pass
 
@@ -136,9 +148,30 @@ async def get_video_url_playwright(url: str, browser_ctx) -> str | None:
 
         await page.close()
 
+        # Filtrar e priorizar URLs sem marca d'água
         mp4_urls = [u for u in video_urls if ".mp4" in u]
+        
         if mp4_urls:
-            return mp4_urls[0]
+            # Função para penalizar URLs com 'wm' (watermark)
+            def score_url(u):
+                u_lower = u.lower()
+                score = 0
+                if "wm" in u_lower or "watermark" in u_lower:
+                    score += 100
+                return score
+                
+            mp4_urls.sort(key=score_url)
+            
+            best_url = mp4_urls[0]
+            
+            # Tentar remover _wm da URL para forçar o vídeo limpo
+            import re
+            clean_forced = re.sub(r'(_wm|-wm|watermark)', '', best_url, flags=re.IGNORECASE)
+            if clean_forced != best_url:
+                # Se mudou, colocar a URL limpa como prioridade 1 para testar no download
+                return clean_forced
+                
+            return best_url
 
         return video_urls[0] if video_urls else None
     except Exception as e:
